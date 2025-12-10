@@ -1,0 +1,24 @@
+{
+  "name": "com.ludu.claude-mcp-bridge",
+  "version": "1.0.0",
+  "displayName": "Claude MCP Bridge",
+  "description": "Unity Editor bridge for Claude Code MCP Server - enables AI-powered Unity development",
+  "unity": "2022.3",
+  "unityRelease": "0f1",
+  "documentationUrl": "https://github.com/ludu/unity-god-mode",
+  "changelogUrl": "https://github.com/ludu/unity-god-mode/blob/main/CHANGELOG.md",
+  "licensesUrl": "https://github.com/ludu/unity-god-mode/blob/main/LICENSE",
+  "keywords": [
+    "claude",
+    "mcp",
+    "ai",
+    "automation",
+    "editor",
+    "tools"
+  ],
+  "author": {
+    "name": "LUDU",
+    "email": "producer@luduarts.com",
+    "url": "https://luduarts.com"
+  }
+}

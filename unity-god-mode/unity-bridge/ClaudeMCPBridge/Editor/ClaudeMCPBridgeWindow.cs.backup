@@ -1,0 +1,2404 @@
+using UnityEngine;
+using UnityEditor;
+using UnityEditor.SceneManagement;
+using System;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace ClaudeMCP
+{
+    /// <summary>
+    /// Unity Editor window that acts as a bridge between Claude Code MCP Server and Unity Editor.
+    /// Listens on TCP port 7777 for commands from the MCP server.
+    /// </summary>
+    public class ClaudeMCPBridgeWindow : EditorWindow
+    {
+        private TcpListener tcpListener;
+        private Thread listenerThread;
+        private bool isRunning = false;
+        private const int PORT = 7777;
+
+        private List<string> logMessages = new List<string>();
+        private Vector2 scrollPosition;
+        private const int MAX_LOG_MESSAGES = 100;
+        private Queue<string> pendingLogs = new Queue<string>();
+        private readonly object logLock = new object();
+
+        [MenuItem("Window/Claude MCP Bridge")]
+        public static void ShowWindow()
+        {
+            var window = GetWindow<ClaudeMCPBridgeWindow>("Claude MCP Bridge");
+            window.minSize = new Vector2(400, 300);
+        }
+
+        private void OnEnable()
+        {
+            StartServer();
+        }
+
+        private void OnDisable()
+        {
+            StopServer();
+        }
+
+        private void OnGUI()
+        {
+            // Process pending logs on main thread
+            ProcessPendingLogs();
+
+            EditorGUILayout.Space(10);
+
+            // Header
+            EditorGUILayout.LabelField("Claude MCP Bridge for Unity 6", EditorStyles.boldLabel);
+            EditorGUILayout.Space(5);
+
+            // Status
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField("Status:", GUILayout.Width(60));
+
+            if (isRunning)
+            {
+                GUI.contentColor = Color.green;
+                EditorGUILayout.LabelField("● Running", EditorStyles.boldLabel);
+            }
+            else
+            {
+                GUI.contentColor = Color.red;
+                EditorGUILayout.LabelField("● Stopped", EditorStyles.boldLabel);
+            }
+            GUI.contentColor = Color.white;
+            EditorGUILayout.EndHorizontal();
+
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField("Port:", GUILayout.Width(60));
+            EditorGUILayout.LabelField(PORT.ToString());
+            EditorGUILayout.EndHorizontal();
+
+            EditorGUILayout.Space(10);
+            EditorGUILayout.LabelField("Server Log", EditorStyles.boldLabel);
+
+            // Log area
+            scrollPosition = EditorGUILayout.BeginScrollView(scrollPosition, GUILayout.ExpandHeight(true));
+            foreach (var message in logMessages)
+            {
+                EditorGUILayout.LabelField(message, EditorStyles.wordWrappedLabel);
+            }
+            EditorGUILayout.EndScrollView();
+
+            EditorGUILayout.Space(10);
+
+            // Controls
+            EditorGUILayout.BeginHorizontal();
+            if (GUILayout.Button(isRunning ? "Restart Server" : "Start Server"))
+            {
+                if (isRunning) StopServer();
+                StartServer();
+            }
+
+            if (GUILayout.Button("Clear Log"))
+            {
+                logMessages.Clear();
+            }
+            EditorGUILayout.EndHorizontal();
+
+            EditorGUILayout.Space(10);
+            EditorGUILayout.HelpBox(
+                "This bridge enables Claude Code to control Unity Editor in real-time.\n" +
+                "Keep this window open while using Unity God Mode features in Claude Code.",
+                MessageType.Info
+            );
+        }
+
+        private void StartServer()
+        {
+            if (isRunning) return;
+
+            try
+            {
+                tcpListener = new TcpListener(IPAddress.Loopback, PORT);
+                tcpListener.Start();
+
+                listenerThread = new Thread(ListenForClients);
+                listenerThread.IsBackground = true;
+                listenerThread.Start();
+
+                isRunning = true;
+                AddLog($"✅ Server started on port {PORT}");
+                Debug.Log($"[Claude MCP Bridge] Server started on port {PORT}");
+            }
+            catch (Exception ex)
+            {
+                AddLog($"❌ Failed to start server: {ex.Message}");
+                Debug.LogError($"[Claude MCP Bridge] Failed to start server: {ex.Message}");
+            }
+        }
+
+        private void StopServer()
+        {
+            if (!isRunning) return;
+
+            isRunning = false;
+
+            try
+            {
+                if (tcpListener != null)
+                {
+                    tcpListener.Stop();
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[Claude MCP Bridge] Error stopping listener: {ex.Message}");
+            }
+
+            // Don't abort thread, just let it finish naturally
+            listenerThread = null;
+
+            AddLog("⚠️ Server stopped");
+            Debug.Log("[Claude MCP Bridge] Server stopped");
+        }
+
+        private void ListenForClients()
+        {
+            while (isRunning)
+            {
+                try
+                {
+                    TcpClient client = tcpListener.AcceptTcpClient();
+                    Thread clientThread = new Thread(() => HandleClient(client));
+                    clientThread.IsBackground = true;
+                    clientThread.Start();
+                }
+                catch (Exception ex)
+                {
+                    if (isRunning)
+                    {
+                        Debug.LogError($"[Claude MCP Bridge] Listener error: {ex.Message}");
+                    }
+                }
+            }
+        }
+
+        private void HandleClient(TcpClient client)
+        {
+            NetworkStream stream = client.GetStream();
+            StreamReader reader = new StreamReader(stream, Encoding.UTF8);
+            StreamWriter writer = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
+
+            try
+            {
+                string line;
+                while ((line = reader.ReadLine()) != null && isRunning)
+                {
+                    string response = ProcessCommand(line);
+                    writer.WriteLine(response);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Claude MCP Bridge] Client handler error: {ex.Message}");
+            }
+            finally
+            {
+                stream.Close();
+                client.Close();
+            }
+        }
+
+        private string ProcessCommand(string jsonCommand)
+        {
+            try
+            {
+                // Parse the incoming JSON manually to handle params properly
+                var jsonObj = MiniJSON.Json.Deserialize(jsonCommand) as Dictionary<string, object>;
+                if (jsonObj == null)
+                    throw new Exception("Invalid JSON command");
+
+                string commandName = jsonObj.ContainsKey("command") ? jsonObj["command"] as string : null;
+                if (string.IsNullOrEmpty(commandName))
+                    throw new Exception("Command name is missing");
+
+                AddLogThreadSafe($"📨 Command: {commandName}");
+
+                // Convert params object to JSON string
+                string paramsJson = "{}";
+                if (jsonObj.ContainsKey("params") && jsonObj["params"] != null)
+                {
+                    paramsJson = MiniJSON.Json.Serialize(jsonObj["params"]);
+                }
+
+                object result = null;
+                Exception executionError = null;
+                bool executed = false;
+
+                // Execute on main thread - use update delegate for immediate execution
+                Debug.Log($"[Bridge] Scheduling command: {commandName} with params: {paramsJson}");
+                EditorApplication.CallbackFunction callback = null;
+                callback = () =>
+                {
+                    Debug.Log($"[Bridge] Executing command: {commandName}");
+                    EditorApplication.update -= callback;
+                    try
+                    {
+                        result = ExecuteCommand(commandName, paramsJson);
+                        Debug.Log($"[Bridge] Command executed successfully: {commandName}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogError($"[Bridge] Command execution error: {ex.Message}\n{ex.StackTrace}");
+                        executionError = ex;
+                    }
+                    finally
+                    {
+                        executed = true;
+                    }
+                };
+                EditorApplication.update += callback;
+
+                // Wait for execution (with timeout) - 10 seconds
+                int timeout = 0;
+                while (!executed && timeout < 1000)
+                {
+                    Thread.Sleep(10);
+                    timeout++;
+                }
+
+                if (!executed)
+                {
+                    string error = "Command execution timeout";
+                    AddLogThreadSafe($"❌ Error: {error}");
+                    var errorResponse = new ErrorResponse { error = error };
+                    return JsonUtility.ToJson(errorResponse);
+                }
+
+                if (executionError != null)
+                {
+                    AddLogThreadSafe($"❌ Error: {executionError.Message}");
+                    var errorResponse = new ErrorResponse { error = executionError.Message };
+                    return JsonUtility.ToJson(errorResponse);
+                }
+
+                AddLogThreadSafe($"✅ Success: {commandName}");
+
+                // Directly serialize the result
+                if (result != null)
+                {
+                    string resultJson = JsonUtility.ToJson(result);
+                    Debug.Log($"[Bridge] Result type: {result.GetType().Name}, JSON: {resultJson}");
+
+                    // If JsonUtility returns empty object, use manual serialization for ProjectInfo
+                    if (result is ProjectInfo info)
+                    {
+                        return $"{{\"result\":{{\"unityVersion\":\"{info.unityVersion}\",\"projectName\":\"{info.projectName}\",\"projectPath\":\"{info.projectPath}\",\"platform\":\"{info.platform}\",\"companyName\":\"{info.companyName}\"}}}}";
+                    }
+
+                    // Manual serialization for HierarchyResult (arrays not supported by JsonUtility)
+                    if (result is HierarchyResult hierarchyResult)
+                    {
+                        string hierarchyJson = "[" + string.Join(",", hierarchyResult.hierarchy.Select(h => $"\"{h}\"")) + "]";
+                        return $"{{\"result\":{{\"hierarchy\":{hierarchyJson}}}}}";
+                    }
+
+                    return $"{{\"result\":{resultJson}}}";
+                }
+
+                return "{\"result\":null}";
+            }
+            catch (Exception ex)
+            {
+                AddLogThreadSafe($"❌ Error: {ex.Message}");
+                var errorResponse = new ErrorResponse { error = ex.Message };
+                return JsonUtility.ToJson(errorResponse);
+            }
+        }
+
+        private object ExecuteCommand(string command, string paramsJson)
+        {
+            Debug.Log($"[Bridge] ExecuteCommand - command: '{command}', params: '{paramsJson}'");
+
+            switch (command)
+            {
+                case "CreateGameObject":
+                    Debug.Log("[Bridge] ExecuteCommand: CreateGameObject case");
+                    return CreateGameObject(paramsJson);
+
+                case "SetTransform":
+                    Debug.Log("[Bridge] ExecuteCommand: SetTransform case");
+                    return SetTransform(paramsJson);
+
+                case "AddComponent":
+                    Debug.Log("[Bridge] ExecuteCommand: AddComponent case");
+                    return AddComponent(paramsJson);
+
+                case "CreateScene":
+                    Debug.Log("[Bridge] ExecuteCommand: CreateScene case");
+                    return CreateScene(paramsJson);
+
+                case "SaveScene":
+                    Debug.Log("[Bridge] ExecuteCommand: SaveScene case");
+                    return SaveScene(paramsJson);
+
+                case "ListScenes":
+                    Debug.Log("[Bridge] ExecuteCommand: ListScenes case");
+                    return ListScenes();
+
+                case "GetHierarchy":
+                    Debug.Log("[Bridge] ExecuteCommand: GetHierarchy case");
+                    return GetHierarchy(paramsJson);
+
+                case "DeleteGameObject":
+                    Debug.Log("[Bridge] ExecuteCommand: DeleteGameObject case");
+                    return DeleteGameObject(paramsJson);
+
+                case "GetProjectInfo":
+                    Debug.Log("[Bridge] ExecuteCommand: GetProjectInfo case");
+                    return GetProjectInfo();
+
+                case "CreateScript":
+                    Debug.Log("[Bridge] ExecuteCommand: CreateScript case");
+                    return CreateScript(paramsJson);
+
+                case "SetComponentProperty":
+                    Debug.Log("[Bridge] ExecuteCommand: SetComponentProperty case");
+                    return SetComponentProperty(paramsJson);
+
+                case "CreatePrefab":
+                    Debug.Log("[Bridge] ExecuteCommand: CreatePrefab case");
+                    return CreatePrefab(paramsJson);
+
+                case "SetMaterial":
+                    Debug.Log("[Bridge] ExecuteCommand: SetMaterial case");
+                    return SetMaterial(paramsJson);
+
+                case "GetComponentProperty":
+                    Debug.Log("[Bridge] ExecuteCommand: GetComponentProperty case");
+                    return GetComponentProperty(paramsJson);
+
+                case "FindAssets":
+                    Debug.Log("[Bridge] ExecuteCommand: FindAssets case");
+                    return FindAssets(paramsJson);
+
+                case "BatchCreateGameObjects":
+                    Debug.Log("[Bridge] ExecuteCommand: BatchCreateGameObjects case");
+                    return BatchCreateGameObjects(paramsJson);
+
+                // ===== PHASE 1: CRITICAL COMMANDS (30) =====
+
+                case "RemoveComponent":
+                    return RemoveComponent(paramsJson);
+
+                case "SetActive":
+                    return SetActive(paramsJson);
+
+                case "GetActiveState":
+                    return GetActiveState(paramsJson);
+
+                case "SetParent":
+                    return SetParentCommand(paramsJson);
+
+                case "GetParent":
+                    return GetParent(paramsJson);
+
+                case "GetChildren":
+                    return GetChildren(paramsJson);
+
+                case "RenameGameObject":
+                    return RenameGameObject(paramsJson);
+
+                case "DuplicateGameObject":
+                    return DuplicateGameObject(paramsJson);
+
+                case "InstantiatePrefab":
+                    return InstantiatePrefab(paramsJson);
+
+                case "LoadScene":
+                    return LoadSceneCommand(paramsJson);
+
+                case "EnterPlayMode":
+                    return EnterPlayMode(paramsJson);
+
+                case "ExitPlayMode":
+                    return ExitPlayMode(paramsJson);
+
+                case "SetRigidbodyProperty":
+                    return SetRigidbodyProperty(paramsJson);
+
+                case "SetColliderProperty":
+                    return SetColliderProperty(paramsJson);
+
+                case "SetLightProperty":
+                    return SetLightProperty(paramsJson);
+
+                case "SetCameraProperty":
+                    return SetCameraProperty(paramsJson);
+
+                case "CreateMaterial":
+                    return CreateMaterial(paramsJson);
+
+                case "SetMaterialProperty":
+                    return SetMaterialPropertyCommand(paramsJson);
+
+                case "CreateFolder":
+                    return CreateFolder(paramsJson);
+
+                case "DeleteAsset":
+                    return DeleteAsset(paramsJson);
+
+                case "RefreshAssetDatabase":
+                    return RefreshAssetDatabase(paramsJson);
+
+                case "SelectGameObject":
+                    return SelectGameObject(paramsJson);
+
+                case "FocusGameObject":
+                    return FocusGameObject(paramsJson);
+
+                case "LogMessage":
+                    return LogMessageCommand(paramsJson);
+
+                case "ClearConsole":
+                    return ClearConsole(paramsJson);
+
+                case "FindGameObjectsByTag":
+                    return FindGameObjectsByTag(paramsJson);
+
+                case "FindGameObjectsWithComponent":
+                    return FindGameObjectsWithComponent(paramsJson);
+
+                // ===== PHASE 2: UI & ADVANCED (35) =====
+
+                case "SetRectTransform":
+                    return SetRectTransform(paramsJson);
+
+                case "CreateCanvas":
+                    return CreateCanvas(paramsJson);
+
+                case "SetText":
+                    return SetText(paramsJson);
+
+                case "UnpackPrefab":
+                    return UnpackPrefab(paramsJson);
+
+                case "ApplyPrefabChanges":
+                    return ApplyPrefabChanges(paramsJson);
+
+                case "AssignTexture":
+                    return AssignTexture(paramsJson);
+
+                case "SetShader":
+                    return SetShader(paramsJson);
+
+                case "AddForce":
+                    return AddForce(paramsJson);
+
+                case "PlayAudio":
+                    return PlayAudio(paramsJson);
+
+                case "StopAudio":
+                    return StopAudio(paramsJson);
+
+                case "SetAudioProperty":
+                    return SetAudioProperty(paramsJson);
+
+                case "SetAnimatorParameter":
+                    return SetAnimatorParameter(paramsJson);
+
+                case "GetActiveScene":
+                    return GetActiveSceneInfo(paramsJson);
+
+                case "PauseEditor":
+                    return PauseEditor(paramsJson);
+
+                case "MoveAsset":
+                    return MoveAsset(paramsJson);
+
+                case "DuplicateAsset":
+                    return DuplicateAsset(paramsJson);
+
+                case "RenameAsset":
+                    return RenameAsset(paramsJson);
+
+                case "GetAssetDependencies":
+                    return GetAssetDependencies(paramsJson);
+
+                case "FindGameObjectsByLayer":
+                    return FindGameObjectsByLayer(paramsJson);
+
+                case "GetAllComponents":
+                    return GetAllComponents(paramsJson);
+
+                case "HasComponent":
+                    return HasComponent(paramsJson);
+
+                case "SendMessage":
+                    return SendMessageCommand(paramsJson);
+
+                case "SetSiblingIndex":
+                    return SetSiblingIndex(paramsJson);
+
+                case "GetSiblingIndex":
+                    return GetSiblingIndex(paramsJson);
+
+                case "SetLayer":
+                    return SetLayer(paramsJson);
+
+                case "SetTag":
+                    return SetTag(paramsJson);
+
+                case "CopyComponent":
+                    return CopyComponent(paramsJson);
+
+                case "GetMeshInfo":
+                    return GetMeshInfo(paramsJson);
+
+                case "SetQualityLevel":
+                    return SetQualityLevel(paramsJson);
+
+                case "CaptureScreenshot":
+                    return CaptureScreenshot(paramsJson);
+
+                case "GetAllScenes":
+                    return GetAllScenes(paramsJson);
+
+                case "CreateAnimator":
+                    return CreateAnimator(paramsJson);
+
+                case "CreateParticleSystem":
+                    return CreateParticleSystem(paramsJson);
+
+                case "SetParticleProperty":
+                    return SetParticleProperty(paramsJson);
+
+                default:
+                    throw new Exception($"Unknown command: {command}");
+            }
+        }
+
+        // Command Implementations
+
+        private object CreateGameObject(string paramsJson)
+        {
+            if (string.IsNullOrEmpty(paramsJson))
+                throw new Exception("CreateGameObject params cannot be null or empty");
+
+            var p = JsonUtility.FromJson<CreateGameObjectParams>(paramsJson);
+
+            if (p == null || string.IsNullOrEmpty(p.name))
+                throw new Exception("Invalid CreateGameObject parameters");
+
+            GameObject go;
+
+            switch (p.primitiveType)
+            {
+                case "Cube":
+                    go = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                    break;
+                case "Sphere":
+                    go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                    break;
+                case "Capsule":
+                    go = GameObject.CreatePrimitive(PrimitiveType.Capsule);
+                    break;
+                case "Cylinder":
+                    go = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+                    break;
+                case "Plane":
+                    go = GameObject.CreatePrimitive(PrimitiveType.Plane);
+                    break;
+                case "Quad":
+                    go = GameObject.CreatePrimitive(PrimitiveType.Quad);
+                    break;
+                default:
+                    go = new GameObject();
+                    break;
+            }
+
+            go.name = p.name;
+
+            if (!string.IsNullOrEmpty(p.parent))
+            {
+                GameObject parentObj = GameObject.Find(p.parent);
+                if (parentObj != null)
+                {
+                    go.transform.SetParent(parentObj.transform);
+                }
+            }
+
+            Undo.RegisterCreatedObjectUndo(go, $"Create {p.name}");
+            Selection.activeGameObject = go;
+
+            return new GameObjectResult { success = true, name = p.name, instanceId = go.GetInstanceID() };
+        }
+
+        private object SetTransform(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<SetTransformParams>(paramsJson);
+
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null)
+            {
+                throw new Exception($"GameObject not found: {p.gameObjectName}");
+            }
+
+            Undo.RecordObject(go.transform, "Set Transform");
+
+            if (p.position != null)
+            {
+                go.transform.position = new Vector3(p.position.x, p.position.y, p.position.z);
+            }
+
+            if (p.rotation != null)
+            {
+                go.transform.eulerAngles = new Vector3(p.rotation.x, p.rotation.y, p.rotation.z);
+            }
+
+            if (p.scale != null)
+            {
+                go.transform.localScale = new Vector3(p.scale.x, p.scale.y, p.scale.z);
+            }
+
+            return new SimpleResult { success = true };
+        }
+
+        private object AddComponent(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<AddComponentParams>(paramsJson);
+
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null)
+            {
+                throw new Exception($"GameObject not found: {p.gameObjectName}");
+            }
+
+            // Try UnityEngine namespace first
+            Type componentType = Type.GetType($"UnityEngine.{p.componentType}, UnityEngine");
+
+            // Try direct type name
+            if (componentType == null)
+            {
+                componentType = Type.GetType(p.componentType);
+            }
+
+            // Search through all loaded assemblies
+            if (componentType == null)
+            {
+                foreach (var assembly in System.AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    componentType = assembly.GetTypes().FirstOrDefault(t =>
+                        t.Name == p.componentType && typeof(Component).IsAssignableFrom(t));
+
+                    if (componentType != null)
+                        break;
+                }
+            }
+
+            if (componentType == null)
+            {
+                throw new Exception($"Component type not found: {p.componentType}. Make sure the script is compiled and inherits from MonoBehaviour or Component.");
+            }
+
+            Component component = Undo.AddComponent(go, componentType);
+
+            return new ComponentResult { success = true, componentType = componentType.Name };
+        }
+
+        private object CreateScene(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<CreateSceneParams>(paramsJson);
+
+            var mode = p.additive ? UnityEditor.SceneManagement.NewSceneMode.Additive :
+                                    UnityEditor.SceneManagement.NewSceneMode.Single;
+
+            var scene = EditorSceneManager.NewScene(UnityEditor.SceneManagement.NewSceneSetup.DefaultGameObjects, mode);
+
+            return new SceneResult { success = true, sceneName = scene.name };
+        }
+
+        private object SaveScene(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<SaveSceneParams>(paramsJson);
+
+            string path = p.path;
+            if (string.IsNullOrEmpty(path))
+            {
+                var activeScene = EditorSceneManager.GetActiveScene();
+                if (string.IsNullOrEmpty(activeScene.path))
+                {
+                    throw new Exception("Scene has no path. Please provide a save path.");
+                }
+                path = activeScene.path;
+            }
+
+            if (!path.StartsWith("Assets/"))
+            {
+                path = "Assets/Scenes/" + path;
+            }
+
+            if (!path.EndsWith(".unity"))
+            {
+                path += ".unity";
+            }
+
+            string directory = Path.GetDirectoryName(path);
+            if (!Directory.Exists(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            EditorSceneManager.SaveScene(EditorSceneManager.GetActiveScene(), path);
+
+            return new PathResult { success = true, path = path };
+        }
+
+        private object ListScenes()
+        {
+            string[] guids = AssetDatabase.FindAssets("t:Scene");
+            List<string> scenes = new List<string>();
+
+            foreach (string guid in guids)
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guid);
+                scenes.Add(path);
+            }
+
+            return new { scenes = scenes.ToArray() };
+        }
+
+        private object GetHierarchy(string paramsJson)
+        {
+            try
+            {
+                Debug.Log($"[Bridge] GetHierarchy START - paramsJson: {paramsJson}");
+                var p = JsonUtility.FromJson<GetHierarchyParams>(paramsJson);
+                Debug.Log($"[Bridge] GetHierarchy params parsed - rootOnly: {p.rootOnly}");
+
+                List<string> hierarchy = new List<string>();
+                GameObject[] rootObjects = UnityEngine.SceneManagement.SceneManager.GetActiveScene().GetRootGameObjects();
+
+                Debug.Log($"[Bridge] GetHierarchy: Found {rootObjects.Length} root objects");
+
+                foreach (GameObject root in rootObjects)
+                {
+                    if (p.rootOnly)
+                    {
+                        hierarchy.Add(root.name);
+                    }
+                    else
+                    {
+                        AddHierarchyRecursive(root.transform, "", hierarchy);
+                    }
+                }
+
+                Debug.Log($"[Bridge] GetHierarchy: Total hierarchy items: {hierarchy.Count}");
+                var result = new HierarchyResult { hierarchy = hierarchy.ToArray() };
+                Debug.Log($"[Bridge] GetHierarchy: Result array length: {result.hierarchy.Length}");
+                return result;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[Bridge] GetHierarchy ERROR: {ex.Message}\n{ex.StackTrace}");
+                throw;
+            }
+        }
+
+        private void AddHierarchyRecursive(Transform transform, string indent, List<string> list)
+        {
+            list.Add($"{indent}{transform.name}");
+            foreach (Transform child in transform)
+            {
+                AddHierarchyRecursive(child, indent + "  ", list);
+            }
+        }
+
+        private object DeleteGameObject(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<DeleteGameObjectParams>(paramsJson);
+
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null)
+            {
+                throw new Exception($"GameObject not found: {p.gameObjectName}");
+            }
+
+            Undo.DestroyObjectImmediate(go);
+
+            return new SimpleResult { success = true };
+        }
+
+        private object GetProjectInfo()
+        {
+            var info = new ProjectInfo
+            {
+                unityVersion = Application.unityVersion,
+                projectName = Application.productName,
+                projectPath = Application.dataPath,
+                platform = Application.platform.ToString(),
+                companyName = Application.companyName
+            };
+            return info;
+        }
+
+        private object CreateScript(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<CreateScriptParams>(paramsJson);
+
+            string path = p.path;
+            if (string.IsNullOrEmpty(path))
+            {
+                path = "Assets/Scripts/";
+            }
+
+            if (!path.StartsWith("Assets/"))
+            {
+                path = "Assets/" + path;
+            }
+
+            if (!path.EndsWith("/"))
+            {
+                path += "/";
+            }
+
+            string fullPath = path + p.scriptName + ".cs";
+
+            string directory = Path.GetDirectoryName(fullPath);
+            if (!Directory.Exists(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            File.WriteAllText(fullPath, p.scriptContent);
+            AssetDatabase.Refresh();
+
+            return new PathResult { success = true, path = fullPath };
+        }
+
+        private object SetComponentProperty(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<SetComponentPropertyParams>(paramsJson);
+
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null)
+            {
+                throw new Exception($"GameObject not found: {p.gameObjectName}");
+            }
+
+            // Find component by type name
+            Component component = null;
+            foreach (var comp in go.GetComponents<Component>())
+            {
+                if (comp.GetType().Name == p.componentType)
+                {
+                    component = comp;
+                    break;
+                }
+            }
+
+            if (component == null)
+            {
+                throw new Exception($"Component '{p.componentType}' not found on GameObject '{p.gameObjectName}'");
+            }
+
+            // Get the field or property
+            var type = component.GetType();
+            var field = type.GetField(p.propertyName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            var property = type.GetProperty(p.propertyName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+            if (field == null && property == null)
+            {
+                throw new Exception($"Property/Field '{p.propertyName}' not found on component '{p.componentType}'");
+            }
+
+            Undo.RecordObject(component, $"Set {p.propertyName}");
+
+            // Convert value based on target type
+            Type targetType = field != null ? field.FieldType : property.PropertyType;
+            object convertedValue = ConvertValue(p.value, p.valueType, targetType);
+
+            // Set the value
+            if (field != null)
+            {
+                field.SetValue(component, convertedValue);
+            }
+            else
+            {
+                property.SetValue(component, convertedValue);
+            }
+
+            EditorUtility.SetDirty(component);
+
+            return new SimpleResult { success = true };
+        }
+
+        private object ConvertValue(string value, string valueType, Type targetType)
+        {
+            // Handle GameObject/UnityEngine.Object references
+            if (targetType == typeof(GameObject) || typeof(UnityEngine.Object).IsAssignableFrom(targetType))
+            {
+                if (string.IsNullOrEmpty(value))
+                    return null;
+
+                // Try to find GameObject first
+                GameObject go = GameObject.Find(value);
+                if (go != null)
+                {
+                    if (targetType == typeof(GameObject))
+                        return go;
+
+                    // Try to get component of target type
+                    var comp = go.GetComponent(targetType);
+                    if (comp != null)
+                        return comp;
+                }
+
+                // Try to load asset
+                var asset = AssetDatabase.LoadAssetAtPath(value, targetType);
+                if (asset != null)
+                    return asset;
+
+                // Search for prefab by name
+                string[] guids = AssetDatabase.FindAssets($"{value} t:Prefab");
+                if (guids.Length > 0)
+                {
+                    string path = AssetDatabase.GUIDToAssetPath(guids[0]);
+                    asset = AssetDatabase.LoadAssetAtPath(path, targetType);
+                    if (asset != null)
+                        return asset;
+                }
+
+                return null;
+            }
+
+            // Handle primitive types
+            switch (valueType.ToLower())
+            {
+                case "int":
+                    return int.Parse(value);
+                case "float":
+                    return float.Parse(value);
+                case "bool":
+                    return bool.Parse(value);
+                case "string":
+                    return value;
+                default:
+                    return value;
+            }
+        }
+
+        private object CreatePrefab(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<CreatePrefabParams>(paramsJson);
+
+            GameObject go = GameObject.Find(p.sourceGameObjectName);
+            if (go == null)
+            {
+                throw new Exception($"GameObject not found: {p.sourceGameObjectName}");
+            }
+
+            string fullPath = p.prefabPath.StartsWith("Assets/") ? p.prefabPath : $"Assets/{p.prefabPath}";
+
+            // Ensure directory exists
+            string directory = Path.GetDirectoryName(fullPath);
+            if (!Directory.Exists(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            GameObject prefab = PrefabUtility.SaveAsPrefabAsset(go, fullPath);
+
+            return new PrefabResult
+            {
+                success = true,
+                prefabPath = fullPath,
+                prefabName = prefab.name
+            };
+        }
+
+        private object SetMaterial(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<SetMaterialParams>(paramsJson);
+
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null)
+            {
+                throw new Exception($"GameObject not found: {p.gameObjectName}");
+            }
+
+            Renderer renderer = go.GetComponent<Renderer>();
+            if (renderer == null)
+            {
+                throw new Exception($"No Renderer component found on GameObject: {p.gameObjectName}");
+            }
+
+            Material mat = AssetDatabase.LoadAssetAtPath<Material>(p.materialPath);
+            if (mat == null)
+            {
+                throw new Exception($"Material not found at path: {p.materialPath}");
+            }
+
+            Undo.RecordObject(renderer, "Set Material");
+            renderer.material = mat;
+            EditorUtility.SetDirty(renderer);
+
+            return new SimpleResult { success = true };
+        }
+
+        private object GetComponentProperty(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<GetComponentPropertyParams>(paramsJson);
+
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null)
+            {
+                throw new Exception($"GameObject not found: {p.gameObjectName}");
+            }
+
+            // Find component by type name
+            Component component = null;
+            foreach (var comp in go.GetComponents<Component>())
+            {
+                if (comp.GetType().Name == p.componentType)
+                {
+                    component = comp;
+                    break;
+                }
+            }
+
+            if (component == null)
+            {
+                throw new Exception($"Component '{p.componentType}' not found on GameObject '{p.gameObjectName}'");
+            }
+
+            // Get the field or property
+            var type = component.GetType();
+            var field = type.GetField(p.propertyName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            var property = type.GetProperty(p.propertyName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+            if (field == null && property == null)
+            {
+                throw new Exception($"Property/Field '{p.propertyName}' not found on component '{p.componentType}'");
+            }
+
+            object value = field != null ? field.GetValue(component) : property.GetValue(component);
+            string valueStr = value != null ? value.ToString() : "null";
+
+            return new PropertyResult
+            {
+                success = true,
+                value = valueStr,
+                valueType = value != null ? value.GetType().Name : "null"
+            };
+        }
+
+        private object FindAssets(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<FindAssetsParams>(paramsJson);
+
+            string[] guids = AssetDatabase.FindAssets(p.searchQuery);
+            List<string> paths = new List<string>();
+
+            foreach (string guid in guids)
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guid);
+                paths.Add(path);
+            }
+
+            return new AssetListResult
+            {
+                success = true,
+                assetPaths = paths.ToArray(),
+                count = paths.Count
+            };
+        }
+
+        private object BatchCreateGameObjects(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<BatchCreateGameObjectsParams>(paramsJson);
+            List<string> createdNames = new List<string>();
+
+            foreach (var item in p.gameObjects)
+            {
+                GameObject go = null;
+
+                // Create based on primitive type
+                switch (item.primitiveType)
+                {
+                    case "Cube":
+                        go = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                        break;
+                    case "Sphere":
+                        go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                        break;
+                    case "Capsule":
+                        go = GameObject.CreatePrimitive(PrimitiveType.Capsule);
+                        break;
+                    case "Cylinder":
+                        go = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+                        break;
+                    case "Plane":
+                        go = GameObject.CreatePrimitive(PrimitiveType.Plane);
+                        break;
+                    case "Quad":
+                        go = GameObject.CreatePrimitive(PrimitiveType.Quad);
+                        break;
+                    default:
+                        go = new GameObject();
+                        break;
+                }
+
+                go.name = item.name;
+
+                // Set parent first (if specified)
+                if (!string.IsNullOrEmpty(item.parent))
+                {
+                    GameObject parent = GameObject.Find(item.parent);
+                    if (parent != null)
+                    {
+                        go.transform.SetParent(parent.transform, false); // worldPositionStays = false
+                    }
+                }
+
+                // Set transform (use local coordinates since we have a parent)
+                if (item.position != null)
+                {
+                    go.transform.localPosition = new Vector3(item.position.x, item.position.y, item.position.z);
+                }
+                if (item.rotation != null)
+                {
+                    go.transform.localEulerAngles = new Vector3(item.rotation.x, item.rotation.y, item.rotation.z);
+                }
+
+                // Check if scale was provided (Vector3Data is struct, so check if it has non-zero values)
+                bool hasScale = item.scale.x != 0 || item.scale.y != 0 || item.scale.z != 0;
+                if (hasScale)
+                {
+                    go.transform.localScale = new Vector3(item.scale.x, item.scale.y, item.scale.z);
+                }
+                else
+                {
+                    // Default scale to (1,1,1) if not specified
+                    go.transform.localScale = Vector3.one;
+                }
+
+                Undo.RegisterCreatedObjectUndo(go, "Batch Create GameObject");
+                createdNames.Add(go.name);
+            }
+
+            return new BatchCreateResult
+            {
+                success = true,
+                createdObjects = createdNames.ToArray(),
+                count = createdNames.Count
+            };
+        }
+
+        // Helper Methods
+
+        private void AddLog(string message)
+        {
+            string timestamp = DateTime.Now.ToString("HH:mm:ss");
+            logMessages.Add($"[{timestamp}] {message}");
+
+            if (logMessages.Count > MAX_LOG_MESSAGES)
+            {
+                logMessages.RemoveAt(0);
+            }
+
+            Repaint();
+        }
+
+        private void AddLogThreadSafe(string message)
+        {
+            lock (logLock)
+            {
+                pendingLogs.Enqueue(message);
+            }
+            EditorApplication.delayCall += () => Repaint();
+        }
+
+        private void ProcessPendingLogs()
+        {
+            lock (logLock)
+            {
+                while (pendingLogs.Count > 0)
+                {
+                    string message = pendingLogs.Dequeue();
+                    string timestamp = DateTime.Now.ToString("HH:mm:ss");
+                    logMessages.Add($"[{timestamp}] {message}");
+
+                    if (logMessages.Count > MAX_LOG_MESSAGES)
+                    {
+                        logMessages.RemoveAt(0);
+                    }
+                }
+            }
+        }
+
+        // Data Classes
+
+        [Serializable]
+        private class CommandRequest
+        {
+            public string command;
+            public string @params;
+        }
+
+        [Serializable]
+        private class CreateGameObjectParams
+        {
+            public string name;
+            public string primitiveType;
+            public string parent;
+        }
+
+        [Serializable]
+        private class SetTransformParams
+        {
+            public string gameObjectName;
+            public Vector3Data position;
+            public Vector3Data rotation;
+            public Vector3Data scale;
+        }
+
+        [Serializable]
+        private class Vector3Data
+        {
+            public float x;
+            public float y;
+            public float z;
+        }
+
+        [Serializable]
+        private class AddComponentParams
+        {
+            public string gameObjectName;
+            public string componentType;
+        }
+
+        [Serializable]
+        private class CreateSceneParams
+        {
+            public string sceneName;
+            public bool additive;
+        }
+
+        [Serializable]
+        private class SaveSceneParams
+        {
+            public string path;
+        }
+
+        [Serializable]
+        private class GetHierarchyParams
+        {
+            public bool rootOnly;
+        }
+
+        [Serializable]
+        private class DeleteGameObjectParams
+        {
+            public string gameObjectName;
+        }
+
+        [Serializable]
+        private class CreateScriptParams
+        {
+            public string scriptName;
+            public string scriptContent;
+            public string path;
+        }
+
+        [Serializable]
+        private class SetComponentPropertyParams
+        {
+            public string gameObjectName;
+            public string componentType;
+            public string propertyName;
+            public string value;
+            public string valueType; // "int", "float", "bool", "string", "GameObject", "Object"
+        }
+
+        [Serializable]
+        private class CreatePrefabParams
+        {
+            public string sourceGameObjectName;
+            public string prefabPath;
+        }
+
+        [Serializable]
+        private class SetMaterialParams
+        {
+            public string gameObjectName;
+            public string materialPath;
+        }
+
+        [Serializable]
+        private class GetComponentPropertyParams
+        {
+            public string gameObjectName;
+            public string componentType;
+            public string propertyName;
+        }
+
+        [Serializable]
+        private class FindAssetsParams
+        {
+            public string searchQuery;
+        }
+
+        [Serializable]
+        private class BatchCreateGameObjectsParams
+        {
+            public BatchGameObjectData[] gameObjects;
+        }
+
+        [Serializable]
+        private class BatchGameObjectData
+        {
+            public string name;
+            public string primitiveType;
+            public Vector3Data position;
+            public Vector3Data rotation;
+            public Vector3Data scale;
+            public string parent;
+        }
+
+        [Serializable]
+        private class PrefabResult
+        {
+            public bool success;
+            public string prefabPath;
+            public string prefabName;
+        }
+
+        [Serializable]
+        private class PropertyResult
+        {
+            public bool success;
+            public string value;
+            public string valueType;
+        }
+
+        [Serializable]
+        private class AssetListResult
+        {
+            public bool success;
+            public string[] assetPaths;
+            public int count;
+        }
+
+        [Serializable]
+        private class BatchCreateResult
+        {
+            public bool success;
+            public string[] createdObjects;
+            public int count;
+        }
+
+        [Serializable]
+        private class ProjectInfo
+        {
+            public string unityVersion;
+            public string projectName;
+            public string projectPath;
+            public string platform;
+            public string companyName;
+        }
+
+        [Serializable]
+        private class ErrorResponse
+        {
+            public string error;
+        }
+
+        [Serializable]
+        private class SimpleResult
+        {
+            public bool success;
+        }
+
+        [Serializable]
+        private class GameObjectResult
+        {
+            public bool success;
+            public string name;
+            public int instanceId;
+        }
+
+        [Serializable]
+        private class ComponentResult
+        {
+            public bool success;
+            public string componentType;
+        }
+
+        [Serializable]
+        private class SceneResult
+        {
+            public bool success;
+            public string sceneName;
+        }
+
+        [Serializable]
+        private class PathResult
+        {
+            public bool success;
+            public string path;
+        }
+
+        [Serializable]
+        private class HierarchyResult
+        {
+            public string[] hierarchy;
+        }
+
+    // Simple JSON parser for handling dynamic params
+    public static class MiniJSON
+    {
+        public static class Json
+        {
+            public static object Deserialize(string json)
+            {
+                return Parser.Parse(json);
+            }
+
+            public static string Serialize(object obj)
+            {
+                return Serializer.Serialize(obj);
+            }
+        }
+
+        sealed class Parser
+        {
+            const string WORD_BREAK = "{}[],:\"";
+
+            public static object Parse(string json)
+            {
+                if (json == null) return null;
+                return new Parser(json).ParseValue();
+            }
+
+            StringReader json;
+
+            Parser(string jsonString)
+            {
+                json = new StringReader(jsonString);
+            }
+
+            object ParseValue()
+            {
+                NextToken();
+                switch (json.Peek())
+                {
+                    case '{':
+                        return ParseObject();
+                    case '[':
+                        return ParseArray();
+                    case '"':
+                        return ParseString();
+                    case '-':
+                    case '0':
+                    case '1':
+                    case '2':
+                    case '3':
+                    case '4':
+                    case '5':
+                    case '6':
+                    case '7':
+                    case '8':
+                    case '9':
+                        return ParseNumber();
+                }
+
+                string word = NextWord();
+                if (word == "false") return false;
+                if (word == "true") return true;
+                if (word == "null") return null;
+                return word;
+            }
+
+            Dictionary<string, object> ParseObject()
+            {
+                var table = new Dictionary<string, object>();
+                json.Read(); // {
+
+                while (true)
+                {
+                    switch (NextToken())
+                    {
+                        case '}':
+                            json.Read();
+                            return table;
+                        case ',':
+                            json.Read();
+                            continue;
+                        default:
+                            string name = ParseString();
+                            if (name == null) return table;
+
+                            NextToken();
+                            if ((char)json.Read() != ':') return null;
+
+                            table[name] = ParseValue();
+                            break;
+                    }
+                }
+            }
+
+            List<object> ParseArray()
+            {
+                var array = new List<object>();
+                json.Read(); // [
+
+                while (true)
+                {
+                    char nextToken = NextToken();
+                    if (nextToken == ']')
+                    {
+                        json.Read();
+                        return array;
+                    }
+
+                    if (nextToken == ',')
+                    {
+                        json.Read();
+                        continue;
+                    }
+
+                    array.Add(ParseValue());
+                }
+            }
+
+            string ParseString()
+            {
+                var s = new System.Text.StringBuilder();
+                json.Read(); // "
+
+                while (true)
+                {
+                    if (json.Peek() == -1) break;
+
+                    char c = (char)json.Read();
+                    if (c == '"') return s.ToString();
+
+                    if (c == '\\')
+                    {
+                        if (json.Peek() == -1) break;
+
+                        c = (char)json.Read();
+                        if (c == '"' || c == '\\' || c == '/') s.Append(c);
+                        else if (c == 'b') s.Append('\b');
+                        else if (c == 'f') s.Append('\f');
+                        else if (c == 'n') s.Append('\n');
+                        else if (c == 'r') s.Append('\r');
+                        else if (c == 't') s.Append('\t');
+                    }
+                    else
+                    {
+                        s.Append(c);
+                    }
+                }
+
+                return s.ToString();
+            }
+
+            object ParseNumber()
+            {
+                string number = NextWord();
+                if (number.IndexOf('.') == -1)
+                {
+                    long parsedInt;
+                    long.TryParse(number, out parsedInt);
+                    return parsedInt;
+                }
+
+                double parsedDouble;
+                double.TryParse(number, out parsedDouble);
+                return parsedDouble;
+            }
+
+            void EatWhitespace()
+            {
+                while (char.IsWhiteSpace((char)json.Peek()))
+                    json.Read();
+            }
+
+            char NextToken()
+            {
+                EatWhitespace();
+                return (char)json.Peek();
+            }
+
+            string NextWord()
+            {
+                var word = new System.Text.StringBuilder();
+
+                while (!IsWordBreak((char)json.Peek()))
+                {
+                    word.Append((char)json.Read());
+                    if (json.Peek() == -1) break;
+                }
+
+                return word.ToString();
+            }
+
+            bool IsWordBreak(char c)
+            {
+                return char.IsWhiteSpace(c) || WORD_BREAK.IndexOf(c) != -1;
+            }
+        }
+
+        sealed class Serializer
+        {
+            System.Text.StringBuilder builder;
+
+            Serializer()
+            {
+                builder = new System.Text.StringBuilder();
+            }
+
+            public static string Serialize(object obj)
+            {
+                var instance = new Serializer();
+                instance.SerializeValue(obj);
+                return instance.builder.ToString();
+            }
+
+            void SerializeValue(object value)
+            {
+                if (value == null)
+                {
+                    builder.Append("null");
+                }
+                else if (value is string)
+                {
+                    SerializeString((string)value);
+                }
+                else if (value is bool)
+                {
+                    builder.Append(((bool)value) ? "true" : "false");
+                }
+                else if (value is Dictionary<string, object>)
+                {
+                    SerializeObject((Dictionary<string, object>)value);
+                }
+                else if (value is List<object>)
+                {
+                    SerializeArray((List<object>)value);
+                }
+                else if (value is long || value is int)
+                {
+                    builder.Append(value.ToString());
+                }
+                else if (value is double || value is float)
+                {
+                    builder.Append(((double)value).ToString("R"));
+                }
+                else
+                {
+                    SerializeString(value.ToString());
+                }
+            }
+
+            void SerializeObject(Dictionary<string, object> obj)
+            {
+                bool first = true;
+                builder.Append('{');
+
+                foreach (var e in obj)
+                {
+                    if (!first) builder.Append(',');
+                    SerializeString(e.Key);
+                    builder.Append(':');
+                    SerializeValue(e.Value);
+                    first = false;
+                }
+
+                builder.Append('}');
+            }
+
+            void SerializeArray(List<object> array)
+            {
+                bool first = true;
+                builder.Append('[');
+
+                foreach (var obj in array)
+                {
+                    if (!first) builder.Append(',');
+                    SerializeValue(obj);
+                    first = false;
+                }
+
+                builder.Append(']');
+            }
+
+            void SerializeString(string str)
+            {
+                builder.Append('\"');
+
+                foreach (char c in str)
+                {
+                    if (c == '"') builder.Append("\\\"");
+                    else if (c == '\\') builder.Append("\\\\");
+                    else if (c == '\b') builder.Append("\\b");
+                    else if (c == '\f') builder.Append("\\f");
+                    else if (c == '\n') builder.Append("\\n");
+                    else if (c == '\r') builder.Append("\\r");
+                    else if (c == '\t') builder.Append("\\t");
+                    else builder.Append(c);
+                }
+
+                builder.Append('\"');
+            }
+        }
+    }
+
+        // ===== PHASE 1: CRITICAL COMMAND IMPLEMENTATIONS (30) =====
+
+        private object SetComponentProperty(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<SetComponentPropertyParams>(paramsJson);
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null) throw new Exception($"GameObject not found: {p.gameObjectName}");
+
+            Component component = go.GetComponent(p.componentType);
+            if (component == null) throw new Exception($"Component not found: {p.componentType}");
+
+            var prop = component.GetType().GetProperty(p.propertyName);
+            if (prop != null && prop.CanWrite)
+            {
+                object value = ConvertValue(p.value, prop.PropertyType);
+                prop.SetValue(component, value);
+                return new SimpleResult { success = true };
+            }
+
+            var field = component.GetType().GetField(p.propertyName);
+            if (field != null)
+            {
+                object value = ConvertValue(p.value, field.FieldType);
+                field.SetValue(component, value);
+                return new SimpleResult { success = true };
+            }
+
+            throw new Exception($"Property/Field not found: {p.propertyName}");
+        }
+
+        private object ConvertValue(string value, Type targetType)
+        {
+            if (targetType == typeof(int)) return int.Parse(value);
+            if (targetType == typeof(float)) return float.Parse(value);
+            if (targetType == typeof(bool)) return bool.Parse(value);
+            if (targetType == typeof(string)) return value;
+            if (targetType == typeof(Color))
+            {
+                string[] parts = value.Split(',');
+                return new Color(float.Parse(parts[0]), float.Parse(parts[1]), float.Parse(parts[2]), parts.Length > 3 ? float.Parse(parts[3]) : 1f);
+            }
+            if (targetType == typeof(Vector3))
+            {
+                string[] parts = value.Split(',');
+                return new Vector3(float.Parse(parts[0]), float.Parse(parts[1]), float.Parse(parts[2]));
+            }
+            return Convert.ChangeType(value, targetType);
+        }
+
+        private object RemoveComponent(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<RemoveComponentParams>(paramsJson);
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null) throw new Exception($"GameObject not found: {p.gameObjectName}");
+
+            Component component = go.GetComponent(p.componentType);
+            if (component == null) throw new Exception($"Component not found: {p.componentType}");
+
+            Undo.DestroyObjectImmediate(component);
+            return new SimpleResult { success = true };
+        }
+
+        private object SetActive(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<SetActiveParams>(paramsJson);
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null) throw new Exception($"GameObject not found: {p.gameObjectName}");
+
+            Undo.RecordObject(go, "Set Active");
+            go.SetActive(p.active);
+            return new SimpleResult { success = true };
+        }
+
+        private object GetActiveState(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<SimpleNameParams>(paramsJson);
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null) throw new Exception($"GameObject not found: {p.gameObjectName}");
+
+            return new BoolResult { success = true, value = go.activeSelf };
+        }
+
+        private object SetParentCommand(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<SetParentParams>(paramsJson);
+            GameObject child = GameObject.Find(p.childGameObjectName);
+            if (child == null) throw new Exception($"Child GameObject not found: {p.childGameObjectName}");
+
+            if (string.IsNullOrEmpty(p.parentGameObjectName))
+            {
+                Undo.SetTransformParent(child.transform, null, "Set Parent");
+            }
+            else
+            {
+                GameObject parent = GameObject.Find(p.parentGameObjectName);
+                if (parent == null) throw new Exception($"Parent GameObject not found: {p.parentGameObjectName}");
+                Undo.SetTransformParent(child.transform, parent.transform, "Set Parent");
+            }
+
+            return new SimpleResult { success = true };
+        }
+
+        private object GetParent(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<SimpleNameParams>(paramsJson);
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null) throw new Exception($"GameObject not found: {p.gameObjectName}");
+
+            return new StringResult { success = true, value = go.transform.parent != null ? go.transform.parent.name : null };
+        }
+
+        private object GetChildren(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<GetChildrenParams>(paramsJson);
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null) throw new Exception($"GameObject not found: {p.gameObjectName}");
+
+            List<string> children = new List<string>();
+            if (p.recursive)
+            {
+                GetChildrenRecursive(go.transform, children);
+            }
+            else
+            {
+                foreach (Transform child in go.transform)
+                {
+                    children.Add(child.name);
+                }
+            }
+
+            return new StringArrayResult { success = true, values = children.ToArray() };
+        }
+
+        private void GetChildrenRecursive(Transform parent, List<string> children)
+        {
+            foreach (Transform child in parent)
+            {
+                children.Add(child.name);
+                GetChildrenRecursive(child, children);
+            }
+        }
+
+        private object RenameGameObject(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<RenameParams>(paramsJson);
+            GameObject go = GameObject.Find(p.oldName);
+            if (go == null) throw new Exception($"GameObject not found: {p.oldName}");
+
+            Undo.RecordObject(go, "Rename GameObject");
+            go.name = p.newName;
+            return new SimpleResult { success = true };
+        }
+
+        private object DuplicateGameObject(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<DuplicateParams>(paramsJson);
+            GameObject source = GameObject.Find(p.sourceGameObjectName);
+            if (source == null) throw new Exception($"GameObject not found: {p.sourceGameObjectName}");
+
+            GameObject duplicate = Instantiate(source, source.transform.parent);
+            duplicate.name = p.newName;
+            Undo.RegisterCreatedObjectUndo(duplicate, "Duplicate GameObject");
+
+            return new StringResult { success = true, value = duplicate.name };
+        }
+
+        private object InstantiatePrefab(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<InstantiatePrefabParams>(paramsJson);
+            GameObject prefab = AssetDatabase.LoadAssetAtPath<GameObject>(p.prefabPath);
+            if (prefab == null) throw new Exception($"Prefab not found: {p.prefabPath}");
+
+            GameObject instance = (GameObject)PrefabUtility.InstantiatePrefab(prefab);
+            if (p.position != null)
+            {
+                instance.transform.position = new Vector3(p.position.x, p.position.y, p.position.z);
+            }
+            if (p.rotation != null)
+            {
+                instance.transform.eulerAngles = new Vector3(p.rotation.x, p.rotation.y, p.rotation.z);
+            }
+            if (!string.IsNullOrEmpty(p.parent))
+            {
+                GameObject parent = GameObject.Find(p.parent);
+                if (parent != null)
+                {
+                    instance.transform.SetParent(parent.transform);
+                }
+            }
+
+            Undo.RegisterCreatedObjectUndo(instance, "Instantiate Prefab");
+            return new StringResult { success = true, value = instance.name };
+        }
+
+        private object SaveSceneCommand(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<SaveSceneParams>(paramsJson);
+            UnityEngine.SceneManagement.Scene scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+
+            if (string.IsNullOrEmpty(p.scenePath))
+            {
+                EditorSceneManager.SaveScene(scene);
+            }
+            else
+            {
+                EditorSceneManager.SaveScene(scene, p.scenePath);
+            }
+
+            return new SimpleResult { success = true };
+        }
+
+        private object LoadSceneCommand(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<LoadSceneParams>(paramsJson);
+            EditorSceneManager.OpenScene(p.scenePath);
+            return new SimpleResult { success = true };
+        }
+
+        private object EnterPlayMode(string paramsJson)
+        {
+            EditorApplication.isPlaying = true;
+            return new SimpleResult { success = true };
+        }
+
+        private object ExitPlayMode(string paramsJson)
+        {
+            EditorApplication.isPlaying = false;
+            return new SimpleResult { success = true };
+        }
+
+        private object SetRigidbodyProperty(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<SetComponentPropertyParams>(paramsJson);
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null) throw new Exception($"GameObject not found: {p.gameObjectName}");
+
+            Rigidbody rb = go.GetComponent<Rigidbody>();
+            if (rb == null) throw new Exception("Rigidbody component not found");
+
+            Undo.RecordObject(rb, "Set Rigidbody Property");
+
+            switch (p.propertyName.ToLower())
+            {
+                case "mass": rb.mass = float.Parse(p.value); break;
+                case "drag": rb.drag = float.Parse(p.value); break;
+                case "angulardrag": rb.angularDrag = float.Parse(p.value); break;
+                case "usegravity": rb.useGravity = bool.Parse(p.value); break;
+                case "iskinematic": rb.isKinematic = bool.Parse(p.value); break;
+                default: throw new Exception($"Unknown Rigidbody property: {p.propertyName}");
+            }
+
+            return new SimpleResult { success = true };
+        }
+
+        private object SetColliderProperty(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<SetComponentPropertyParams>(paramsJson);
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null) throw new Exception($"GameObject not found: {p.gameObjectName}");
+
+            Collider collider = go.GetComponent<Collider>();
+            if (collider == null) throw new Exception("Collider component not found");
+
+            Undo.RecordObject(collider, "Set Collider Property");
+
+            if (p.propertyName.ToLower() == "istrigger")
+            {
+                collider.isTrigger = bool.Parse(p.value);
+            }
+            else if (collider is BoxCollider box && p.propertyName.ToLower() == "size")
+            {
+                string[] parts = p.value.Split(',');
+                box.size = new Vector3(float.Parse(parts[0]), float.Parse(parts[1]), float.Parse(parts[2]));
+            }
+            else if (collider is SphereCollider sphere && p.propertyName.ToLower() == "radius")
+            {
+                sphere.radius = float.Parse(p.value);
+            }
+
+            return new SimpleResult { success = true };
+        }
+
+        private object SetLightProperty(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<SetComponentPropertyParams>(paramsJson);
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null) throw new Exception($"GameObject not found: {p.gameObjectName}");
+
+            Light light = go.GetComponent<Light>();
+            if (light == null) throw new Exception("Light component not found");
+
+            Undo.RecordObject(light, "Set Light Property");
+
+            switch (p.propertyName.ToLower())
+            {
+                case "intensity": light.intensity = float.Parse(p.value); break;
+                case "range": light.range = float.Parse(p.value); break;
+                case "color":
+                    string[] parts = p.value.Split(',');
+                    light.color = new Color(float.Parse(parts[0]), float.Parse(parts[1]), float.Parse(parts[2]));
+                    break;
+                default: throw new Exception($"Unknown Light property: {p.propertyName}");
+            }
+
+            return new SimpleResult { success = true };
+        }
+
+        private object SetCameraProperty(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<SetComponentPropertyParams>(paramsJson);
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null) throw new Exception($"GameObject not found: {p.gameObjectName}");
+
+            Camera camera = go.GetComponent<Camera>();
+            if (camera == null) throw new Exception("Camera component not found");
+
+            Undo.RecordObject(camera, "Set Camera Property");
+
+            switch (p.propertyName.ToLower())
+            {
+                case "fov":
+                case "fieldofview": camera.fieldOfView = float.Parse(p.value); break;
+                case "nearclipplane": camera.nearClipPlane = float.Parse(p.value); break;
+                case "farclipplane": camera.farClipPlane = float.Parse(p.value); break;
+                default: throw new Exception($"Unknown Camera property: {p.propertyName}");
+            }
+
+            return new SimpleResult { success = true };
+        }
+
+        private object CreateMaterial(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<CreateMaterialParams>(paramsJson);
+            string fullPath = p.materialPath.StartsWith("Assets/") ? p.materialPath : $"Assets/{p.materialPath}";
+
+            string directory = Path.GetDirectoryName(fullPath);
+            if (!Directory.Exists(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            Material material = new Material(Shader.Find(p.shaderName ?? "Standard"));
+            AssetDatabase.CreateAsset(material, fullPath);
+            AssetDatabase.SaveAssets();
+            AssetDatabase.Refresh();
+
+            return new StringResult { success = true, value = fullPath };
+        }
+
+        private object SetMaterialPropertyCommand(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<SetMaterialPropertyParams>(paramsJson);
+            Material material = AssetDatabase.LoadAssetAtPath<Material>(p.materialPath);
+            if (material == null) throw new Exception($"Material not found: {p.materialPath}");
+
+            Undo.RecordObject(material, "Set Material Property");
+
+            switch (p.propertyName.ToLower())
+            {
+                case "color":
+                    string[] parts = p.value.Split(',');
+                    material.color = new Color(float.Parse(parts[0]), float.Parse(parts[1]), float.Parse(parts[2]), parts.Length > 3 ? float.Parse(parts[3]) : 1f);
+                    break;
+                case "metallic": material.SetFloat("_Metallic", float.Parse(p.value)); break;
+                case "smoothness": material.SetFloat("_Glossiness", float.Parse(p.value)); break;
+                default:
+                    material.SetFloat(p.propertyName, float.Parse(p.value));
+                    break;
+            }
+
+            EditorUtility.SetDirty(material);
+            AssetDatabase.SaveAssets();
+
+            return new SimpleResult { success = true };
+        }
+
+        private object CreateFolder(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<CreateFolderParams>(paramsJson);
+            string fullPath = p.folderPath.StartsWith("Assets/") ? p.folderPath : $"Assets/{p.folderPath}";
+
+            if (!AssetDatabase.IsValidFolder(fullPath))
+            {
+                string parentFolder = Path.GetDirectoryName(fullPath).Replace("\\", "/");
+                string folderName = Path.GetFileName(fullPath);
+                AssetDatabase.CreateFolder(parentFolder, folderName);
+                AssetDatabase.Refresh();
+            }
+
+            return new SimpleResult { success = true };
+        }
+
+        private object DeleteAsset(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<DeleteAssetParams>(paramsJson);
+            AssetDatabase.DeleteAsset(p.assetPath);
+            AssetDatabase.Refresh();
+            return new SimpleResult { success = true };
+        }
+
+        private object RefreshAssetDatabase(string paramsJson)
+        {
+            AssetDatabase.Refresh();
+            return new SimpleResult { success = true };
+        }
+
+        private object CreateScriptCommand(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<CreateScriptParams>(paramsJson);
+            string fullPath = p.path.StartsWith("Assets/") ? p.path : $"Assets/{p.path}";
+
+            string directory = Path.GetDirectoryName(fullPath);
+            if (!Directory.Exists(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            string filePath = Path.Combine(fullPath, $"{p.scriptName}.cs");
+            File.WriteAllText(filePath, p.scriptContent);
+            AssetDatabase.Refresh();
+
+            return new StringResult { success = true, value = filePath };
+        }
+
+        private object SelectGameObject(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<SimpleNameParams>(paramsJson);
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null) throw new Exception($"GameObject not found: {p.gameObjectName}");
+
+            Selection.activeGameObject = go;
+            return new SimpleResult { success = true };
+        }
+
+        private object FocusGameObject(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<SimpleNameParams>(paramsJson);
+            GameObject go = GameObject.Find(p.gameObjectName);
+            if (go == null) throw new Exception($"GameObject not found: {p.gameObjectName}");
+
+            Selection.activeGameObject = go;
+            SceneView.FrameLastActiveSceneView();
+            return new SimpleResult { success = true };
+        }
+
+        private object LogMessageCommand(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<LogMessageParams>(paramsJson);
+
+            switch (p.logType?.ToLower())
+            {
+                case "warning": Debug.LogWarning(p.message); break;
+                case "error": Debug.LogError(p.message); break;
+                default: Debug.Log(p.message); break;
+            }
+
+            return new SimpleResult { success = true };
+        }
+
+        private object ClearConsole(string paramsJson)
+        {
+            var assembly = System.Reflection.Assembly.GetAssembly(typeof(SceneView));
+            var type = assembly.GetType("UnityEditor.LogEntries");
+            var method = type.GetMethod("Clear");
+            method.Invoke(new object(), null);
+
+            return new SimpleResult { success = true };
+        }
+
+        private object FindGameObjectsByTag(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<FindByTagParams>(paramsJson);
+            GameObject[] objects = GameObject.FindGameObjectsWithTag(p.tag);
+            string[] names = objects.Select(go => go.name).ToArray();
+
+            return new StringArrayResult { success = true, values = names };
+        }
+
+        private object FindGameObjectsWithComponent(string paramsJson)
+        {
+            var p = JsonUtility.FromJson<FindByComponentParams>(paramsJson);
+            Type componentType = Type.GetType(p.componentType);
+            if (componentType == null)
+            {
+                componentType = typeof(UnityEngine.MonoBehaviour).Assembly.GetType($"UnityEngine.{p.componentType}");
+            }
+            if (componentType == null) throw new Exception($"Component type not found: {p.componentType}");
+
+            var objects = GameObject.FindObjectsOfType(componentType);
+            string[] names = objects.Select(obj => ((Component)obj).gameObject.name).ToArray();
+
+            return new StringArrayResult { success = true, values = names };
+        }
+
+        // ===== PARAMETER CLASSES FOR PHASE 1 =====
+
+        [Serializable]
+        private class SetComponentPropertyParams
+        {
+            public string gameObjectName;
+            public string componentType;
+            public string propertyName;
+            public string value;
+        }
+
+        [Serializable]
+        private class RemoveComponentParams
+        {
+            public string gameObjectName;
+            public string componentType;
+        }
+
+        [Serializable]
+        private class SetActiveParams
+        {
+            public string gameObjectName;
+            public bool active;
+        }
+
+        [Serializable]
+        private class SimpleNameParams
+        {
+            public string gameObjectName;
+        }
+
+        [Serializable]
+        private class SetParentParams
+        {
+            public string childGameObjectName;
+            public string parentGameObjectName;
+        }
+
+        [Serializable]
+        private class GetChildrenParams
+        {
+            public string gameObjectName;
+            public bool recursive;
+        }
+
+        [Serializable]
+        private class RenameParams
+        {
+            public string oldName;
+            public string newName;
+        }
+
+        [Serializable]
+        private class DuplicateParams
+        {
+            public string sourceGameObjectName;
+            public string newName;
+        }
+
+        [Serializable]
+        private class InstantiatePrefabParams
+        {
+            public string prefabPath;
+            public Vector3Data position;
+            public Vector3Data rotation;
+            public string parent;
+        }
+
+        [Serializable]
+        private class SaveSceneParams
+        {
+            public string scenePath;
+        }
+
+        [Serializable]
+        private class LoadSceneParams
+        {
+            public string scenePath;
+        }
+
+        [Serializable]
+        private class CreateMaterialParams
+        {
+            public string materialPath;
+            public string shaderName;
+        }
+
+        [Serializable]
+        private class SetMaterialPropertyParams
+        {
+            public string materialPath;
+            public string propertyName;
+            public string value;
+        }
+
+        [Serializable]
+        private class CreateFolderParams
+        {
+            public string folderPath;
+        }
+
+        [Serializable]
+        private class DeleteAssetParams
+        {
+            public string assetPath;
+        }
+
+        [Serializable]
+        private class CreateScriptParams
+        {
+            public string scriptName;
+            public string scriptContent;
+            public string path;
+        }
+
+        [Serializable]
+        private class LogMessageParams
+        {
+            public string message;
+            public string logType;
+        }
+
+        [Serializable]
+        private class FindByTagParams
+        {
+            public string tag;
+        }
+
+        [Serializable]
+        private class FindByComponentParams
+        {
+            public string componentType;
+        }
+
+        // ===== RESULT CLASSES FOR PHASE 1 =====
+
+        [Serializable]
+        private class BoolResult
+        {
+            public bool success;
+            public bool value;
+        }
+
+        [Serializable]
+        private class StringArrayResult
+        {
+            public bool success;
+            public string[] values;
+        }
+    }
+}

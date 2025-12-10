@@ -31,7 +31,7 @@ sleep 3
 echo ""
 echo -e "${GREEN}✅ LUDU Prototype Generator hazir!${NC}"
 echo ""
-echo "   Dashboard:  http://localhost:3000"
+echo "   Dashboard:  http://localhost:5173"
 echo "   API:        http://localhost:8000"
 echo "   API Docs:   http://localhost:8000/docs"
 echo ""
