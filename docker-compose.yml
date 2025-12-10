@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  # Web Frontend (React)
+  frontend:
+    build: ./web/frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+    volumes:
+      - ./web/frontend:/app
+      - /app/node_modules
+
+  # Web Backend (Python FastAPI)
+  backend:
+    build: ./web/backend
+    ports:
+      - "8000:8000"
+    environment:
+      - MCP_HOST=mcp-server
+      - MCP_PORT=7778
+      - UNITY_BRIDGE_HOST=host.docker.internal
+      - UNITY_BRIDGE_PORT=7777
+    volumes:
+      - ./web/backend:/app
+      - ./vault/library:/app/library
+      - ./templates:/app/templates
+
+  # MCP Server (Node.js) - Optional, can run on host for Unity connection
+  mcp-server:
+    build: ./mcp/server
+    ports:
+      - "7778:7778"
+    environment:
+      - UNITY_BRIDGE_HOST=host.docker.internal
+      - UNITY_BRIDGE_PORT=7777
+
+volumes:
+  node_modules:
